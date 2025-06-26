@@ -1,0 +1,7 @@
+{
+    "pdf_dir": "pdfs",
+    "output_dir": "output",
+    "dpi": 300,
+    "save_processed_scans": true,
+    "clear_output": false
+}

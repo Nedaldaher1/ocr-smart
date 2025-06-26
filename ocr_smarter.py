@@ -1,57 +1,55 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""
-ocr_smart_arabic_v9.py - نسخة محسنة لمعالجة ملفات PDF العربية.
 
-تحسينات رئيسية في هذه النسخة:
-1.  **بنية مجلدات منظمة:** يتم إنشاء مجلد مخصص لكل ملف PDF مع مجلدات فرعية واضحة:
-    - `markdown_content/`: لحفظ ملفات الماركدوان النهائية.
-    - `illustrative_images/`: لحفظ الصور التوضيحية المستخرجة من صفحات PDF.
-    - `processed_page_scans/`: (اختياري) لحفظ صور الصفحات بعد معالجتها (أبيض وأسود، إزالة التشويش، إلخ).
-2.  **معالجة صور الصفحات:** تتم معالجة كل صفحة من ملف PDF لتحسين جودة النصوص قبل إرسالها إلى النموذج اللغوي (LLM).
-3.  **تحسين مسارات الصور:** يتم تعديل مسارات الصور في ملفات الماركدوان النهائية لتكون نسبية وصحيحة ضمن الهيكل الجديد.
-4.  **كود أنظف:** إعادة تسمية المتغيرات والدوال لجعل الكود أكثر وضوحًا وسهولة في الصيانة.
 """
+ocr_smarter.py - Module
+A module for processing PDF files and converting them to Markdown.
+This module contains all the core functions for image processing,
+content extraction, and communicating with the Large Language Model.
+"""
+
+# --- Library Imports ---
 import os
 import re
 import shutil
 import sys
 import json
 import base64
-import argparse
-import requests
-import fitz  # PyMuPDF
-from pdf2image import convert_from_path
-import cv2
-import numpy as np
+import time
 from typing import List, Dict, Optional
 
-# --- إعدادات البرنامج ---
+import requests
+import fitz  # PyMuPDF
+import cv2
+import numpy as np
+from pdf2image import convert_from_path
+
+# Import rich for optional, styled logging
+try:
+    from rich.console import Console
+except ImportError:
+    # Create a dummy Console class if rich is not available
+    class Console:
+        def print(self, *args, **kwargs):
+            print(*args)
+
+# --- API Configuration ---
 API_URL = "https://openrouter.ai/api/v1/chat/completions"
 MODEL_NAME = "google/gemini-2.5-pro"
-API_KEY_ENV_NAME = "OPENROUTER_API_KEY"
 
-# --- دوال مساعدة ومعالجة أولية ---
+# --- Helper and Pre-processing Functions ---
 def sanitize_filename(name: str) -> str:
-    """إزالة الأحرف غير الصالحة من أسماء الملفات."""
+    """Removes invalid characters from filenames."""
     name = re.sub(r'[\\/*?:"<>|]', "", name)
     name = name.replace(" ", "_").replace("\n", "")
     return name[:100]
 
-def clear_directory(path: str):
-    """حذف وإعادة إنشاء مجلد لضمان نظافته."""
-    if os.path.exists(path):
-        shutil.rmtree(path)
-    os.makedirs(path, exist_ok=True)
-
-# --- دوال معالجة الصور ---
+# --- Image Processing Functions ---
 def preprocess_page_image(page_image: np.ndarray) -> np.ndarray:
-    """تطبيق خط أنابيب معالجة كامل على صورة صفحة واحدة لتحسين جودة النص."""
-    # تحويل من PIL Image إلى تنسيق OpenCV
+    """Applies a full pre-processing pipeline to a single page image."""
     img = cv2.cvtColor(np.array(page_image), cv2.COLOR_RGB2BGR)
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
     
-    # تطبيق سلسلة من التحسينات
     gray = deskew(gray)
     gray = apply_gamma(gray)
     gray = denoise(gray)
@@ -61,7 +59,7 @@ def preprocess_page_image(page_image: np.ndarray) -> np.ndarray:
     return cropped_image
 
 def deskew(gray: np.ndarray) -> np.ndarray:
-    """تصحيح ميلان الصورة."""
+    """Corrects image skew."""
     coords = np.column_stack(np.where(gray < 255))
     if coords.size == 0: return gray
     angle = cv2.minAreaRect(coords)[-1]
@@ -72,22 +70,22 @@ def deskew(gray: np.ndarray) -> np.ndarray:
     return cv2.warpAffine(gray, M, (w, h), flags=cv2.INTER_CUBIC, borderMode=cv2.BORDER_REPLICATE)
 
 def apply_gamma(gray: np.ndarray, gamma: float = 1.2) -> np.ndarray:
-    """تعديل GAMA لتحسين التباين."""
+    """Adjusts gamma to improve contrast."""
     inv_gamma = 1.0 / gamma
     table = np.array([((i / 255.0) ** inv_gamma) * 255 for i in np.arange(256)], dtype="uint8")
     return cv2.LUT(gray, table)
 
 def denoise(gray: np.ndarray, h: float = 20) -> np.ndarray:
-    """إزالة التشويش من الصورة."""
+    """Removes noise from the image."""
     return cv2.fastNlMeansDenoising(gray, h=h)
 
 def binarize(denoised: np.ndarray) -> np.ndarray:
-    """تحويل الصورة إلى أبيض وأسود فقط."""
+    """Converts the image to black and white."""
     _, bw = cv2.threshold(denoised, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
     return bw
 
 def crop_borders(img: np.ndarray, pad: int = 10) -> np.ndarray:
-    """قص الحواف البيضاء الزائدة حول المحتوى."""
+    """Crops white borders around the content."""
     inverted_img = cv2.bitwise_not(img)
     coords = cv2.findNonZero(inverted_img)
     if coords is None: return img
@@ -96,9 +94,9 @@ def crop_borders(img: np.ndarray, pad: int = 10) -> np.ndarray:
     x2, y2 = min(x + w + pad, img.shape[1]), min(y + h + pad, img.shape[0])
     return img[y1:y2, x1:x2]
 
-# --- دوال استخراج المحتوى والاتصال بالنموذج اللغوي ---
-def extract_illustrative_images(doc: fitz.Document, page_num: int, page_images_output_dir: str) -> List[Dict]:
-    """استخراج الصور التوضيحية (غير الزخرفية) من صفحة PDF واحدة."""
+# --- Content Extraction and LLM Functions ---
+def extract_illustrative_images(doc: fitz.Document, page_num: int, page_images_output_dir: str, console: Console) -> List[Dict]:
+    """Extracts illustrative images from a single PDF page."""
     os.makedirs(page_images_output_dir, exist_ok=True)
     page = doc.load_page(page_num)
     image_list = page.get_images(full=True)
@@ -121,121 +119,110 @@ def extract_illustrative_images(doc: fitz.Document, page_num: int, page_images_o
                 f.write(image_bytes)
             
             img_b64 = base64.b64encode(image_bytes).decode('utf-8')
-            # إنشاء مسار نسبي بسيط لاستخدامه في الماركدوان
             relative_path = os.path.join(os.path.basename(page_images_output_dir), img_filename).replace("\\", "/")
             extracted_images.append({"path": relative_path, "base64": img_b64})
         except Exception as e:
-            print(f"      تحذير: لم يتمكن من استخراج الصورة xref={xref} في الصفحة {page_num + 1}. خطأ: {e}")
+            console.print(f"       [yellow]Warning: Could not extract image xref={xref} on page {page_num + 1}. Error: {e}[/yellow]")
             continue
             
     return extracted_images
 
-def generate_analysis_from_llm(full_page_b64: str, sub_images: List[Dict], api_key: str) -> Optional[Dict]:
-    """إرسال صورة الصفحة والصور الفرعية إلى النموذج اللغوي للحصول على تحليل بصيغة JSON."""
+def generate_analysis_from_llm(full_page_b64: str, sub_images: List[Dict], api_key: str, console: Console) -> Optional[Dict]:
+    """Sends page image and sub-images to the LLM for JSON analysis."""
     if not api_key:
-        print(f"خطأ: مفتاح API غير موجود. يرجى تعيين متغير البيئة '{API_KEY_ENV_NAME}'.")
+        console.print("[bold red]Error: API key is not available.[/bold red]")
         return None
 
     headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
     prompt_text = (
-        "أنت مساعد AI خبير في تحويل المواد التعليمية إلى تنسيق Markdown منظم باللغة العربية. "
-        "ستستلم صورة رئيسية لصفحة من كتاب مدرسي، وقائمة بالصور الأصغر المستخرجة منها.\n\n"
-        "مهمتك هي إنشاء كائن JSON واحد يحتوي على المفاتيح التالية: 'unit_name', 'lesson_number', 'lesson_title', 'markdown_content'.\n\n"
-        "اتبع هذه التعليمات بدقة:\n"
-        "1.  **نسخ النص**: قم بتحليل صورة الصفحة الرئيسية ونسخ كل النصوص الموجودة فيها إلى 'markdown_content'.\n"
-        "2.  **التعامل مع الفراغات**: إذا رأيت خطوطًا منقطة (`...........`) أو مناطق أخرى لملء الفراغ، استبدلها بـ `...`.\n"
-        "3.  **الأهم - تقييم أهمية الصور**: لكل صورة من الصور الأصغر، يجب عليك تصنيفها إلى إحدى الفئات الثلاث بناءً على هذه الأولوية:\n"
-        "    أ. **أولوية قصوى (يجب تضمينها)**: **الرسوم البيانية الموضحة والإنفوجرافيك.** هذه هي أهم الصور. تحتوي على رسومات وتسميات نصية (مثل الرسوم التشريحية، الخرائط، المخططات الفنية). يجب تضمينها.\n"
-        "    ب. **محتوى مفيد (تضمين إذا كان ذا صلة)**: الصور التي تحتوي على معلومات بصرية هامة ولكن بدون تسميات نصية (مثل صور الأحداث التاريخية). قم بتضمينها إذا كانت تضيف قيمة للنص.\n"
-        "    ج. **زخرفية (يجب تجاهلها)**: العناصر الزخرفية البحتة. **تجاهل هذه تمامًا.** وهذا يشمل الأيقونات الصغيرة (أقلام رصاص، مصابيح)، الحدود، الشعارات، أو الأشكال المجردة البسيطة.\n"
-        "4.  **دمج ووصف الصور**: بالنسبة للصور في الفئتين (أ) و (ب)، قم بإنشاء وصف عربي واضح وأدخلها في 'markdown_content' في الموضع المنطقي الصحيح باستخدام التنسيق التالي: `![وصف عربي للصورة](مسار_الصورة)`.\n"
-        "5.  **استخراج البيانات الوصفية**: حدد 'unit_name', 'lesson_number', 'lesson_title'. استخدم سلسلة فارغة \"\" إذا لم يتم العثور عليها.\n\n"
-        "مسارات الصور التي تحتاج إلى تقييمها:\n"
+        "You are an expert AI assistant for converting educational materials into structured Arabic Markdown. "
+        "You will receive a main image of a textbook page and a list of smaller images extracted from it.\n\n"
+        "Your task is to create a single JSON object with the keys: 'unit_name', 'lesson_number', 'lesson_title', 'markdown_content'.\n\n"
+        "Follow these instructions precisely:\n"
+        "1.  **Transcribe Text**: Analyze the main page image and transcribe all text into 'markdown_content'.\n"
+        "2.  **Handle Blanks**: If you see dotted lines (`...........`) or other fill-in-the-blank areas, replace them with `...`.\n"
+        "3.  **MOST IMPORTANT - Evaluate Image Importance**: For each of the smaller images, you must classify it into one of three categories based on this priority:\n"
+        "    a. **Top Priority (Must Include)**: **Annotated diagrams and infographics.**\n"
+        "    b. **Useful Content (Include if Relevant)**: Photos that have significant visual information.\n"
+        "    c. **Decorative (Must Ignore)**: Purely decorative elements.\n"
+        "4.  **Integrate and Describe Images**: For important images, create a clear Arabic description and insert it into the markdown using the format: `![وصف عربي للصورة](image_path)`.\n"
+        "5.  **Extract Metadata**: Identify 'unit_name', 'lesson_number', 'lesson_title'. Use an empty string \"\" if not found.\n\n"
+        "Image paths to evaluate:\n"
     )
 
     if sub_images:
         for i, img_info in enumerate(sub_images):
-            prompt_text += f"- مسار الصورة {i+1}: {img_info['path']}\n"
+            prompt_text += f"- Image path {i+1}: {img_info['path']}\n"
     else:
-        prompt_text += "- لم يتم استخراج أي صور فرعية من هذه الصفحة.\n"
+        prompt_text += "- No sub-images were extracted from this page.\n"
         
     message_content = [{"type": "text", "text": prompt_text}]
     message_content.append({"type": "image_url", "image_url": {"url": f"data:image/png;base64,{full_page_b64}"}})
     for img_info in sub_images:
         message_content.append({"type": "image_url", "image_url": {"url": f"data:image/png;base64,{img_info['base64']}"}})
         
-    data = {
-        "model": MODEL_NAME,
-        "messages": [{"role": "user", "content": message_content}],
-        "temperature": 0.0,
-        "response_format": {"type": "json_object"}
-    }
+    data = { "model": MODEL_NAME, "messages": [{"role": "user", "content": message_content}], "temperature": 0.0, "response_format": {"type": "json_object"} }
     
-    try:
-        resp = requests.post(API_URL, headers=headers, json=data, timeout=180)
-        resp.raise_for_status()
-        return resp.json()
-    except requests.exceptions.RequestException as e:
-        print(f"فشل طلب API: {e}")
-        if 'resp' in locals() and hasattr(resp, 'text'):
-            print(f"محتوى الاستجابة: {resp.text}")
-        return None
+    max_retries = 3
+    for attempt in range(max_retries):
+        try:
+            resp = requests.post(API_URL, headers=headers, json=data, timeout=180)
+            resp.raise_for_status()
+            return resp.json()
+        except requests.exceptions.RequestException as e:
+            console.print(f"\n   [yellow]API request failed (Attempt {attempt + 1}/{max_retries}): {e}[/yellow]")
+            if attempt < max_retries - 1:
+                time.sleep(2 ** attempt)
+            else:
+                console.print("[bold red]   Exceeded max retries.[/bold red]")
+                if 'resp' in locals() and hasattr(resp, 'text'):
+                    console.print(f"[red]Last response content: {resp.text}[/red]")
+                return None
 
-# --- الدالة الرئيسية لتنظيم عملية المعالجة ---
-def process_pdf(pdf_path: str, main_output_dir: str, dpi: int, save_scans: bool, api_key: str):
-    """
-    الدالة الرئيسية التي تنسق عملية معالجة ملف PDF واحد من البداية إلى النهاية.
-    """
+# --- Main Processing Functions ---
+def process_single_pdf(pdf_path: str, settings: dict, api_key: str, console: Console):
+    """Coordinates the processing of a single PDF file from start to finish."""
     pdf_base_name = os.path.splitext(os.path.basename(pdf_path))[0]
-    print(f"\n--- بدء معالجة ملف PDF: {pdf_base_name} ---")
+    console.print(f"\n[bold magenta]--- Starting processing for PDF: {pdf_base_name} ---[/bold magenta]")
 
-    # 1. إعداد بنية المجلدات المنظمة للمخرجات
-    pdf_output_root = os.path.join(main_output_dir, pdf_base_name)
+    pdf_output_root = os.path.join(settings["output_dir"], pdf_base_name)
     md_output_dir = os.path.join(pdf_output_root, "markdown_content")
     illustrative_images_dir = os.path.join(pdf_output_root, "illustrative_images")
     processed_scans_dir = os.path.join(pdf_output_root, "processed_page_scans")
 
     os.makedirs(md_output_dir, exist_ok=True)
     os.makedirs(illustrative_images_dir, exist_ok=True)
-    if save_scans:
+    if settings["save_processed_scans"]:
         os.makedirs(processed_scans_dir, exist_ok=True)
 
     try:
-        # 2. تحويل PDF إلى صور وفتحه باستخدام fitz
         doc = fitz.open(pdf_path)
-        pil_page_images = convert_from_path(pdf_path, dpi=dpi, thread_count=4)
+        pil_page_images = convert_from_path(pdf_path, dpi=settings["dpi"], thread_count=4)
     except Exception as e:
-        print(f"خطأ فادح: لا يمكن فتح أو تحويل PDF '{pdf_base_name}'. قد يكون الملف تالفًا. الخطأ: {e}")
+        console.print(f"[bold red]Fatal Error: Could not open or convert PDF '{pdf_base_name}'. File may be corrupt or Poppler is not installed.[/bold red]")
+        console.print(f"Error details: {e}")
         return
 
-    # 3. معالجة كل صفحة على حدة
     for i, page_image in enumerate(pil_page_images):
         page_num = i
-        print(f"  - جاري معالجة الصفحة {page_num + 1}/{len(doc)}...")
+        console.print(f"  - Processing page {page_num + 1}/{len(doc)}...")
         
-        # 4. معالجة صورة الصفحة لتحسينها (B&W، تنقية، إلخ)
         processed_image_np = preprocess_page_image(page_image)
         
-        # 5. (اختياري) حفظ النسخة المعالجة من صورة الصفحة
-        if save_scans:
+        if settings["save_processed_scans"]:
             save_path = os.path.join(processed_scans_dir, f"scan_page_{page_num + 1}.png")
             cv2.imwrite(save_path, processed_image_np)
-            print(f"    تم حفظ صورة الصفحة المعالجة في: '{save_path}'")
 
-        # 6. استخراج الصور التوضيحية من الصفحة الأصلية
         output_dir_for_page_images = os.path.join(illustrative_images_dir, f"page_{page_num + 1}")
-        sub_images = extract_illustrative_images(doc, page_num, output_dir_for_page_images)
+        sub_images = extract_illustrative_images(doc, page_num, output_dir_for_page_images, console)
         if sub_images:
-            print(f"    تم العثور على {len(sub_images)} صورة توضيحية. جاري تقييمها...")
+            console.print(f"    Found {len(sub_images)} illustrative images.")
             
-        # 7. تحويل الصورة المعالجة إلى base64 لإرسالها
         _, buffered = cv2.imencode('.png', processed_image_np)
         full_page_b64 = base64.b64encode(buffered).decode('utf-8')
 
-        # 8. إرسال البيانات إلى النموذج اللغوي
-        result = generate_analysis_from_llm(full_page_b64, sub_images, api_key)
+        result = generate_analysis_from_llm(full_page_b64, sub_images, api_key, console)
         
-        # 9. معالجة النتائج وحفظها
         if result and 'choices' in result and result['choices']:
             try:
                 message_content = result['choices'][0]['message']['content']
@@ -243,21 +230,18 @@ def process_pdf(pdf_path: str, main_output_dir: str, dpi: int, save_scans: bool,
                 markdown_content = json_obj.get('markdown_content')
 
                 if not markdown_content or not markdown_content.strip():
-                    print(f"      تحذير: محتوى الماركدوان فارغ للصفحة {page_num + 1}. تم التخطي."); continue
+                    console.print(f"      [yellow]Warning: Markdown content is empty for page {page_num + 1}. Skipping.[/yellow]")
+                    continue
                 
-                # 10. تنظيف الصور غير المستخدمة وتصحيح المسارات
                 referenced_images = set(re.findall(r'!\[.*?\]\((.*?)\)', markdown_content))
                 for img_info in sub_images:
                     if img_info['path'] not in referenced_images:
                         full_img_path = os.path.join(illustrative_images_dir, img_info['path'])
                         if os.path.exists(full_img_path):
-                            print(f"      تنظيف صورة زخرفية/غير مرجعية: {os.path.basename(full_img_path)}")
                             os.remove(full_img_path)
                 
-                # تصحيح مسارات الصور في الماركدوان لتكون نسبية وصحيحة
                 final_markdown = re.sub(r'(!\[.*?\]\()', r'\1../illustrative_images/', markdown_content)
                 
-                # 11. إنشاء اسم ملف وصفي وحفظ المحتوى
                 unit = json_obj.get('unit_name') or 'UnknownUnit'
                 lesson_num = json_obj.get('lesson_number') or f'Page_{page_num + 1}'
                 title = json_obj.get('lesson_title') or 'Untitled'
@@ -266,64 +250,44 @@ def process_pdf(pdf_path: str, main_output_dir: str, dpi: int, save_scans: bool,
 
                 with open(output_md_path, 'w', encoding='utf-8') as f:
                     f.write(final_markdown)
-                print(f"    نجاح: تم حفظ محتوى الصفحة في '{output_md_path}'")
-
+                console.print(f"    [green]Success: Page content saved to '[/green][cyan]{os.path.basename(output_md_path)}[/cyan]'")
             except (json.JSONDecodeError, KeyError, TypeError) as e:
-                print(f"      خطأ: لا يمكن تحليل استجابة LLM للصفحة {page_num + 1}. خطأ: {e}")
-                print(f"      استجابة LLM الخام: {result['choices'][0]['message']['content']}")
+                console.print(f"      [bold red]Error: Could not parse LLM response for page {page_num + 1}. Error: {e}[/bold red]")
+                console.print(f"      [red]Raw LLM Response: {result['choices'][0]['message']['content']}[/red]")
         else:
-            print(f"      خطأ: لم يتم الحصول على استجابة صالحة من LLM للصفحة {page_num + 1}.")
+            console.print(f"      [bold red]Error: Did not get a valid response from LLM for page {page_num + 1}.[/bold red]")
     doc.close()
+    console.print(f"[bold magenta]--- Finished processing file: {pdf_base_name} ---[/bold magenta]")
 
-def main():
-    """الدالة الرئيسية لتشغيل البرنامج من سطر الأوامر."""
-    # محاولة تحميل متغيرات البيئة من ملف .env
-    try:
-        from dotenv import load_dotenv
-        if load_dotenv():
-            print("تم تحميل متغيرات البيئة من ملف .env.")
-    except ImportError:
-        print("تحذير: 'python-dotenv' غير مثبت. قم بتشغيله: pip install python-dotenv")
-
-    parser = argparse.ArgumentParser(
-        description='خط أنابيب OCR متقدم للمستندات العربية مع اختيار الصور ذي الأولوية.',
-        formatter_class=argparse.RawTextHelpFormatter
-    )
-    parser.add_argument('--pdf-dir', default='pdfs', help="المجلد الذي يحتوي على ملفات PDF للمعالجة.")
-    parser.add_argument('--output-dir', default='output', help="المجلد الرئيسي لحفظ جميع المخرجات (ماركداون وصور).")
-    parser.add_argument('--dpi', type=int, default=300, help="الدقة (DPI) لتحويل PDF إلى صور.")
-    parser.add_argument('--api-key', help=f"مفتاح OpenRouter API. يتجاوز متغير البيئة {API_KEY_ENV_NAME}.")
-    parser.add_argument('--clear-output', action='store_true', help="حذف مجلد المخرجات الرئيسي قبل البدء.")
-    parser.add_argument('--save-processed-scans', action='store_true', help="تمكين حفظ صور الصفحات المعالجة (B&W) للمراجعة.")
-    args = parser.parse_args()
+def run_conversion_pipeline(settings: dict, api_key: str, console: Optional[Console] = None):
+    """
+    This is the main entry point function called by the UI (main.py)
+    to start the processing pipeline for all files.
+    """
+    # If a console object isn't passed, create a default one.
+    if console is None:
+        console = Console()
+        
+    if settings["clear_output"]:
+        console.print(f"[yellow]Clearing previous output directory: {settings['output_dir']}...[/yellow]")
+        if os.path.exists(settings['output_dir']):
+            shutil.rmtree(settings['output_dir'])
     
-    api_key = args.api_key or os.getenv(API_KEY_ENV_NAME)
-    if not api_key:
-        print(f"خطأ فادح: مفتاح API غير موجود. يرجى توفيره عبر سطر الأوامر أو متغيرات البيئة.")
-        sys.exit(1)
+    os.makedirs(settings['output_dir'], exist_ok=True)
+    os.makedirs(settings['pdf_dir'], exist_ok=True)
     
-    if args.clear_output:
-        print("جاري حذف مجلد المخرجات السابق...")
-        if os.path.exists(args.output_dir):
-            shutil.rmtree(args.output_dir)
-    
-    os.makedirs(args.output_dir, exist_ok=True)
-    
-    pdf_files = [f for f in os.listdir(args.pdf_dir) if f.lower().endswith('.pdf')]
+    pdf_files = [f for f in os.listdir(settings['pdf_dir']) if f.lower().endswith('.pdf')]
     if not pdf_files:
-        print(f"لم يتم العثور على ملفات PDF في المجلد '{args.pdf_dir}'.")
+        console.print(f"\n[bold red]No PDF files found in the directory '{settings['pdf_dir']}'.[/bold red]")
+        console.print("Please add some files and try again.")
         return
     
-    print(f"بدء عملية OCR المتقدمة...")
+    console.print(f"\n[bold]Found {len(pdf_files)} PDF file(s). Starting conversion...[/bold]")
     for pdf_file in pdf_files:
-        process_pdf(
-            pdf_path=os.path.join(args.pdf_dir, pdf_file),
-            main_output_dir=args.output_dir,
-            dpi=args.dpi,
-            save_scans=args.save_processed_scans,
-            api_key=api_key
+        process_single_pdf(
+            pdf_path=os.path.join(settings['pdf_dir'], pdf_file),
+            settings=settings,
+            api_key=api_key,
+            console=console
         )
-    print('\nاكتملت العملية بنجاح.')
-
-if __name__ == '__main__':
-    main()
+    console.print('\n[bold green]Successfully completed the process for all files.[/bold green]')
